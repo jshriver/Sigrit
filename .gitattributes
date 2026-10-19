@@ -1,0 +1,3 @@
+# LF everywhere (make recipes break on CRLF, e.g. on Windows checkouts); the net is binary
+* text=auto eol=lf
+*.nnue binary

@@ -1,0 +1,165 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: x86-64-v3, runner: ubuntu-24.04,     shell: 'bash {0}' }
+          - { os: linux,   arch: x86-64-v4, runner: ubuntu-24.04,     shell: 'bash {0}' }
+          - { os: linux,   arch: armv8,     runner: ubuntu-24.04-arm, shell: 'bash {0}' }
+          - { os: windows, arch: x86-64-v3, runner: windows-latest,   shell: 'msys2 {0}', msystem: UCRT64,     packages: 'gcc:p' }
+          - { os: windows, arch: x86-64-v4, runner: windows-latest,   shell: 'msys2 {0}', msystem: UCRT64,     packages: 'gcc:p' }
+          - { os: windows, arch: armv8,     runner: windows-11-arm,   shell: 'msys2 {0}', msystem: CLANGARM64, packages: 'clang:p', make_args: 'CXX=clang++ CC=clang' }
+          - { os: macos,   arch: x86-64-v3, runner: macos-15-intel,   shell: 'bash {0}' }
+          - { os: macos,   arch: x86-64-v4, runner: macos-15-intel,   shell: 'bash {0}' }
+          - { os: macos,   arch: armv8,     runner: macos-15,         shell: 'bash {0}' }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags, for the version string
+
+      - name: Set up MSYS2
+        if: matrix.msystem
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: make git zip
+          pacboy: ${{ matrix.packages }}
+
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$PWD"
+          make -C src -j4 ARCH=${{ matrix.arch }} ${{ matrix.make_args }}
+
+      - name: Check whether this runner can execute the build
+        id: cpu
+        run: |
+          best=$(make -C src --no-print-directory print-arch ${{ matrix.make_args }})
+          case "${{ matrix.arch }}:$best" in
+            x86-64-v3:x86-64-v3|x86-64-v3:x86-64-v4|x86-64-v4:x86-64-v4|armv8:armv8) run=yes ;;
+            *) run=no ;;
+          esac
+          echo "Runner CPU class: $best -> run tests: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Perft
+        if: steps.cpu.outputs.run == 'yes'
+        run: |
+          out=$(printf '%s\n' \
+            'position startpos' 'perft 5' \
+            'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1' 'perft 4' \
+            'setoption name UCI_Chess960 value true' \
+            'position fen bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9' 'perft 4' \
+            'quit' | ./src/sigrit)
+          echo "$out"
+          got=$(echo "$out" | awk '/^nodes/ { printf "%s ", $2 }')
+          [ "$got" = "4865609 4085603 326672 " ] || { echo "::error::perft mismatch: $got"; exit 1; }
+
+      - name: Bench
+        if: steps.cpu.outputs.run == 'yes'
+        run: |
+          ./src/sigrit bench 13 | tee bench.log
+          nodes=$(awk '/^bench:/ { print $2 }' bench.log)
+          [ -n "$nodes" ] || { echo "::error::no bench output"; exit 1; }
+          mkdir -p bench
+          echo "${{ matrix.os }}-${{ matrix.arch }} $nodes" > "bench/${{ matrix.os }}-${{ matrix.arch }}.txt"
+
+      - name: Upload bench result
+        if: steps.cpu.outputs.run == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.arch }}
+          path: bench/
+
+      - name: Package
+        run: |
+          version=$(make -C src --no-print-directory print-version ${{ matrix.make_args }})
+          pkg="sigrit-$version-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg"
+          if [ "${{ matrix.os }}" = windows ]; then
+            cp src/sigrit.exe "dist/$pkg/$pkg.exe"
+          else
+            cp src/sigrit "dist/$pkg/$pkg"
+          fi
+          cp README.md LICENSE "dist/$pkg/"
+          cd dist
+          if [ "${{ matrix.os }}" = windows ]; then
+            zip -r "$pkg.zip" "$pkg"
+          else
+            tar -czf "$pkg.tar.gz" "$pkg"
+          fi
+          rm -rf "$pkg"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigrit-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  # every build that could run must produce the same bench node count
+  consistency:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          merge-multiple: true
+          path: bench
+      - name: Compare bench node counts
+        run: |
+          {
+            echo "| Build | Bench nodes |"
+            echo "|---|---|"
+            cat bench/*.txt | sort | awk '{ print "| " $1 " | " $2 " |" }'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat bench/*.txt
+          distinct=$(cat bench/*.txt | awk '{ print $2 }' | sort -u | wc -l)
+          if [ "$distinct" -ne 1 ]; then
+            echo "::error::builds disagree on the bench node count"
+            exit 1
+          fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, consistency]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sigrit-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "Sigrit ${TAG#v}" --generate-notes
+          fi
