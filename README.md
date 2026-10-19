@@ -125,8 +125,8 @@ To make a release, tag the commit and push the tag (see below).
 
 ## Continuous integration and releases
 
-[`.github/workflows/build.yml`](.github/workflows/build.yml) runs on every push to `main`,
-on pull requests, and on version tags. It builds 9 binaries:
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs only when a version tag
+(starting with `v`) is pushed. Ordinary pushes do not trigger it. It builds 9 binaries:
 
 | | x86-64-v3 | x86-64-v4 | armv8 |
 |---|---|---|---|
@@ -138,7 +138,7 @@ Each job then checks perft (standard and Chess960) and runs `bench`, when the ru
 execute that build. A final job checks that every tested build reports the same bench node
 count, so all platforms and instruction sets play identically.
 
-Pushing a tag that starts with `v` also publishes a GitHub release with all 9 packages
+If every build and check passes, it publishes a GitHub release with all 9 packages
 attached (`.tar.gz` for Linux and macOS, `.zip` for Windows):
 
 ```sh
